@@ -9,8 +9,8 @@ from sqlalchemy import inspect, select
 
 from .db import QUEUE, redis, utcnow
 from .models import (
-    BatchState, CalibrationRelease, ChamberRun, DryBatch, LabEvent, Phase, RecipeLot,
-    ReleaseState, RunState, ShrinkageSample, Stage,
+    BatchState, CalibrationRelease, CalibrationRevision, ChamberRun, DryBatch, LabEvent,
+    Phase, RecipeLot, ReferenceRevocation, ReleaseState, RunState, ShrinkageSample, Stage,
 )
 
 log = logging.getLogger(__name__)
@@ -57,8 +57,10 @@ def release_for(db, run_id):
 
 
 def samples_for(db, run_id, *, retest=False):
-    return db.scalars(select(ShrinkageSample).filter_by(run_id=run_id, is_retest=retest)
-                      .order_by(ShrinkageSample.specimen, ShrinkageSample.id)).all()
+    query = select(ShrinkageSample).filter_by(run_id=run_id, is_retest=retest)
+    if retest:
+        query = query.filter_by(superseded=False)
+    return db.scalars(query.order_by(ShrinkageSample.specimen, ShrinkageSample.id)).all()
 
 
 def vacuum_points(points):
@@ -105,8 +107,8 @@ def add_curve(db, batch, payload, actor):
         release = release_for(db, previous.id)
         if release and release.state != ReleaseState.HELD:
             blocked(db, actor, 'curve.import', '当前校准尚未结案，复测留置后才能导入新周期', batch.code)
-    if batch.state in (BatchState.RELEASED, BatchState.REFERENCE):
-        blocked(db, actor, 'curve.import', '已放行或归档的批次保留原曲线', batch.code)
+    if batch.state in (BatchState.RELEASED, BatchState.REFERENCE, BatchState.REVOKED):
+        blocked(db, actor, 'curve.import', '已放行、归档或撤销认证的批次保留原曲线', batch.code)
     if db.scalar(select(ChamberRun.id).filter_by(batch_code=batch.code, source_name=payload['source_name'])):
         blocked(db, actor, 'curve.import', '同名曲线已存在，请用新文件名保留修订历史', batch.code)
     run = ChamberRun(batch_code=batch.code, **payload)
@@ -177,12 +179,22 @@ def queue_fit(db, batch, actor):
     try:
         run = training_run(db, batch)
         target_pairs = paired_measurements(db, run)
+        snapshot = build_snapshot(db, batch, recipe, run, target_pairs)
     except ValueError as exc:
         blocked(db, actor, 'fit.queue', str(exc), batch.code)
+    release = CalibrationRelease(run_id=run.id, requested_by=actor, input_hash=checksum(snapshot), snapshot=snapshot)
+    db.add(release)
+    batch.state = BatchState.CALIBRATING
+    record(db, actor, 'fit.queue', f'{run.source_name} · {release.input_hash}', batch.code)
+    db.flush()
+    return release
+
+
+def build_snapshot(db, batch, recipe, run, target_pairs):
     reference = db.scalars(select(DryBatch).filter_by(recipe_code=recipe.code, state=BatchState.REFERENCE)
                            .order_by(DryBatch.code)).all()
     if len(reference) < 3:
-        blocked(db, actor, 'fit.queue', '至少需要三个同配方的已认证标定参考批次', batch.code)
+        raise ValueError('至少需要三个同配方的已认证标定参考批次')
     training = []
     for historical in reference:
         archived = latest_run(db, historical.code)
@@ -193,18 +205,12 @@ def queue_fit(db, batch, actor):
         })
     feature_columns = zip(*(item['features'] for item in training), strict=True)
     if not any(max(column) - min(column) > 1e-9 for column in feature_columns):
-        blocked(db, actor, 'fit.queue', '参考批次工况一致，请认证有工况变化的同配方历史批次', batch.code)
-    snapshot = {
+        raise ValueError('参考批次工况一致，请认证有工况变化的同配方历史批次')
+    return {
         'batch': batch.code, 'recipe': recipe.code, 'curve_hash': run.checksum,
         'features': feature_row(batch, recipe, run), 'sample_pairs': target_pairs,
         'window': [round(recipe.window_low, 5), round(recipe.window_high, 5)], 'training': training,
     }
-    release = CalibrationRelease(run_id=run.id, requested_by=actor, input_hash=checksum(snapshot), snapshot=snapshot)
-    db.add(release)
-    batch.state = BatchState.CALIBRATING
-    record(db, actor, 'fit.queue', f'{run.source_name} · {release.input_hash}', batch.code)
-    db.flush()
-    return release
 
 
 def wake_worker(release_id):
@@ -223,6 +229,100 @@ def retry_fit(db, batch, release, actor):
     record(db, actor, 'fit.retry', f'以原输入 {release.input_hash} 重新计算', batch.code)
 
 
+LIVE_STATES = (
+    ReleaseState.QUEUED, ReleaseState.RUNNING, ReleaseState.FAILED, ReleaseState.SUSPENDED,
+    ReleaseState.AWAITING, ReleaseState.RETEST, ReleaseState.VERIFIED,
+)
+
+
+def revision(db, release, kind, *, actor, reason, reference_code=None):
+    db.add(CalibrationRevision(
+        release_id=release.id, kind=kind, reference_code=reference_code, actor=actor, reason=reason,
+        prior_state=release.state.value, input_hash=release.input_hash, snapshot=release.snapshot,
+        result=release.result, prediction_pct=release.prediction_pct, recheck_pct=release.recheck_pct,
+    ))
+
+
+def mark_affected(db, entry, reference_code, reason, actor):
+    revision(db, entry, 'affected', actor=actor, reason=reason, reference_code=reference_code)
+    if entry.affected_at is None:
+        entry.affected_reference = reference_code
+        entry.affected_reason = reason
+        entry.affected_at = utcnow()
+    elif reference_code not in (entry.affected_reference or '').split(','):
+        entry.affected_reference = f'{entry.affected_reference},{reference_code}'
+        entry.affected_reason = f'{entry.affected_reason}；{reason}'
+    record(db, actor, 'release.affected', f'保留原签发 {entry.signed_by} · {reference_code} · {reason}',
+           entry.snapshot['batch'])
+
+
+def suspend_and_recompute(db, target, entry, reference_code, reason, actor):
+    """Rebuild the fit from the original frozen curve and the remaining references.
+
+    The original snapshot is kept in a revision so the release page can show both
+    trial calculations. Recompute reuses this release row; attempts is bumped so a
+    late result computed from the revoked snapshot cannot restore eligibility.
+    """
+    revision(db, entry, 'suspended', actor=actor, reason=reason, reference_code=reference_code)
+    run = db.get(ChamberRun, entry.run_id)
+    recipe = db.get(RecipeLot, target.recipe_code)
+    for sample in samples_for(db, run.id, retest=True):
+        sample.superseded = True
+    try:
+        snapshot = build_snapshot(db, target, recipe, run, paired_measurements(db, run))
+    except ValueError as exc:
+        entry.state = ReleaseState.HELD
+        entry.error = str(exc)[:240]
+        entry.affected_reference = reference_code
+        entry.affected_reason = reason
+        entry.affected_at = utcnow()
+        entry.touched_at = utcnow()
+        target.state = BatchState.REVIEW
+        record(db, actor, 'fit.recompute.blocked', f'{reference_code} · {reason} · {exc}', target.code)
+        return 'held'
+    entry.snapshot = snapshot
+    entry.input_hash = checksum(snapshot)
+    entry.result = None
+    entry.prediction_pct = None
+    entry.recheck_pct = None
+    entry.recheck_note = None
+    entry.error = None
+    entry.state = ReleaseState.SUSPENDED
+    entry.attempts += 1
+    entry.touched_at = utcnow()
+    entry.affected_reference = reference_code
+    entry.affected_reason = reason
+    entry.affected_at = utcnow()
+    target.state = BatchState.CALIBRATING
+    record(db, actor, 'fit.recompute', f'剔除 {reference_code} 后按原冻结曲线重算 · {entry.input_hash}', target.code)
+    return 'suspended'
+
+
+def revoke_reference(db, batch, actor, reason):
+    if batch.state != BatchState.REFERENCE:
+        blocked(db, actor, 'reference.revoke', '只有已认证的历史标定批次可以撤销认证', batch.code)
+    batch.state = BatchState.REVOKED
+    db.add(ReferenceRevocation(batch_code=batch.code, actor=actor, reason=reason))
+    record(db, actor, 'reference.revoke', f'{batch.code} · {reason}', batch.code)
+    candidate_ids = [entry_id for entry_id, snapshot in db.execute(select(CalibrationRelease.id, CalibrationRelease.snapshot))
+                     if any(trained['batch'] == batch.code for trained in snapshot.get('training', []))]
+    summary = {'revoked': batch.code, 'affected': [], 'suspended': [], 'held': []}
+    for entry_id in sorted(candidate_ids):
+        probe = db.get(CalibrationRelease, entry_id)
+        target = db.scalar(select(DryBatch).where(DryBatch.code == probe.snapshot['batch'])
+                           .with_for_update().execution_options(populate_existing=True))
+        entry = db.get(CalibrationRelease, entry_id, with_for_update=True, populate_existing=True)
+        if not any(trained['batch'] == batch.code for trained in entry.snapshot.get('training', [])):
+            continue
+        if entry.state == ReleaseState.RELEASED:
+            mark_affected(db, entry, batch.code, reason, actor)
+            summary['affected'].append(entry.id)
+        elif entry.state in LIVE_STATES:
+            outcome = suspend_and_recompute(db, target, entry, batch.code, reason, actor)
+            summary[outcome].append(entry.id)
+    return summary
+
+
 def inside(value, window):
     return window[0] <= value <= window[1]
 
@@ -230,8 +330,8 @@ def inside(value, window):
 def measure_retest(db, batch, run, release, payload, actor):
     if release.state not in (ReleaseState.AWAITING, ReleaseState.RETEST):
         blocked(db, actor, 'retest.record', '当前校准状态不接受复测', batch.code)
-    if any(item.specimen == payload.specimen for item in samples_for(db, run.id)):
-        blocked(db, actor, 'retest.record', '复测须取独立试片，试片编号不能与首测重复', batch.code)
+    if db.scalar(select(ShrinkageSample.id).filter_by(run_id=run.id, specimen=payload.specimen).limit(1)):
+        blocked(db, actor, 'retest.record', '复测须取独立试片，试片编号不能与首测或既往复测重复', batch.code)
     db.add_all([
         ShrinkageSample(run_id=run.id, technician=actor, specimen=payload.specimen, stage=stage,
                         thickness_mm=reading, is_retest=True)

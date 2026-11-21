@@ -29,6 +29,7 @@ class BatchState(StrEnum):
     CALIBRATING = 'calibrating'
     REVIEW = 'review'
     RELEASED = 'released'
+    REVOKED = 'revoked'
 
 
 class RunState(StrEnum):
@@ -45,6 +46,7 @@ class ReleaseState(StrEnum):
     VERIFIED = 'verified'
     HELD = 'held'
     RELEASED = 'released'
+    SUSPENDED = 'suspended'
 
 
 def enum(values):
@@ -102,6 +104,7 @@ class ShrinkageSample(Base):
     stage: Mapped[Stage] = mapped_column(enum(Stage))
     thickness_mm: Mapped[float] = mapped_column(Double)
     is_retest: Mapped[bool] = mapped_column(Boolean, default=False)
+    superseded: Mapped[bool] = mapped_column(Boolean, default=False)
     technician: Mapped[str] = mapped_column(String(32))
     recorded_at = mapped_column(DateTime(), default=utcnow)
 
@@ -122,8 +125,37 @@ class CalibrationRelease(Base):
     release_note: Mapped[str | None] = mapped_column(String(240))
     signed_by: Mapped[str | None] = mapped_column(String(32))
     signed_at = mapped_column(DateTime(), nullable=True)
+    affected_reference: Mapped[str | None] = mapped_column(String(160))
+    affected_reason: Mapped[str | None] = mapped_column(String(400))
+    affected_at = mapped_column(DateTime(), nullable=True)
     touched_at = mapped_column(DateTime(), default=utcnow)
     attempts: Mapped[int] = mapped_column(default=0)
+
+
+class ReferenceRevocation(Base):
+    __tablename__ = 'reference_revocations'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_code: Mapped[str] = mapped_column(ForeignKey('dry_batches.code'), index=True)
+    actor: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(String(240))
+    revoked_at = mapped_column(DateTime(), default=utcnow)
+
+
+class CalibrationRevision(Base):
+    __tablename__ = 'calibration_revisions'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    release_id: Mapped[int] = mapped_column(ForeignKey('calibration_releases.id'), index=True)
+    kind: Mapped[str] = mapped_column(String(24), index=True)
+    reference_code: Mapped[str | None] = mapped_column(ForeignKey('dry_batches.code'), nullable=True)
+    actor: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(String(240))
+    prior_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    prediction_pct: Mapped[float | None] = mapped_column(Double, nullable=True)
+    recheck_pct: Mapped[float | None] = mapped_column(Double, nullable=True)
+    created_at = mapped_column(DateTime(), default=utcnow)
 
 
 class LabEvent(Base):

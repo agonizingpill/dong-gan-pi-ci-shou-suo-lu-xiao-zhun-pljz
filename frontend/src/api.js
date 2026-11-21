@@ -38,6 +38,7 @@ export const api = {
   freeze: (code, id) => request(`${curvePath(code, id)}/freeze`, 'POST'),
   sample: (code, id, data) => request(`${curvePath(code, id)}/samples`, 'POST', data),
   archive: (code, data) => request(`${batchPath(code)}/archive`, 'POST', data),
+  revoke: (code, data) => request(`${batchPath(code)}/revoke`, 'POST', data),
   fit: code => request(`${batchPath(code)}/calibration`, 'POST'),
   retry: id => request(`${fitPath(id)}/retry`, 'POST'),
   retest: (id, data) => request(`${fitPath(id)}/retest`, 'POST', data),

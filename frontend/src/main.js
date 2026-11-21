@@ -116,6 +116,12 @@ const commands = {
     await draw();
     toast('批次已认证为标定参考');
   },
+  revoke: async data => {
+    const summary = await api.revoke(store.batch.batch.code, data);
+    await draw();
+    const parts = [`受影响 ${summary.affected.length} 单`, `暂停重算 ${summary.suspended.length} 单`, `转留置 ${summary.held.length} 单`];
+    toast(`参考认证已撤销：${parts.join(' · ')}`);
+  },
   fit: async () => {
     const entry = await api.fit(store.batch.batch.code);
     open(`release/${entry.id}`);

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from . import ledger
 from .auth import identity, issue, require, valid_password
 from .db import session
-from .models import CalibrationRelease, ChamberRun, DryBatch, LabEvent, RecipeLot, Role, User
+from .models import CalibrationRelease, CalibrationRevision, ChamberRun, DryBatch, LabEvent, RecipeLot, Role, User
 from .schemas import BatchIn, CurveIn, DecisionIn, Login, RecipeIn, RetestIn, SampleIn
 
 router = APIRouter()
@@ -144,6 +144,16 @@ def archive(code: str, payload: DecisionIn, db: Session = Depends(session), user
     return ledger.row(batch)
 
 
+@router.post('/batches/{code}/revoke')
+def revoke_reference(code: str, payload: DecisionIn, db: Session = Depends(session), user=Depends(supervisor)):
+    batch = ledger.locked_batch(db, code)
+    summary = ledger.revoke_reference(db, batch, user.username, payload.note)
+    db.commit()
+    for entry_id in summary['suspended']:
+        ledger.wake_worker(entry_id)
+    return summary
+
+
 @router.post('/batches/{code}/calibration', status_code=202)
 def request_calibration(code: str, db: Session = Depends(session), user=Depends(lab_staff)):
     batch = ledger.locked_batch(db, code)
@@ -158,7 +168,8 @@ def register(db: Session = Depends(session)):
     rows = db.execute(select(CalibrationRelease, ChamberRun).join(ChamberRun)
                       .order_by(CalibrationRelease.id.desc())).all()
     return [{'id': entry.id, 'batch_code': run.batch_code, 'source_name': run.source_name,
-             'state': entry.state, 'prediction_pct': entry.prediction_pct, 'requested_by': entry.requested_by}
+             'state': entry.state, 'prediction_pct': entry.prediction_pct, 'requested_by': entry.requested_by,
+             'affected_reference': entry.affected_reference, 'affected_reason': entry.affected_reason}
             for entry, run in rows]
 
 
@@ -166,8 +177,11 @@ def register(db: Session = Depends(session)):
 def detail(entry_id: int, db: Session = Depends(session)):
     batch, run, entry = calibration_context(db, entry_id)
     events = db.scalars(select(LabEvent).filter_by(batch_code=batch.code).order_by(LabEvent.id.desc()).limit(30))
+    revisions = db.scalars(select(CalibrationRevision).filter_by(release_id=entry.id)
+                           .order_by(CalibrationRevision.id.desc()))
     return {'batch': ledger.row(batch), 'curve': ledger.row(run), 'entry': ledger.row(entry),
             'retest': [ledger.row(sample) for sample in ledger.samples_for(db, run.id, retest=True)],
+            'revisions': [ledger.row(item) for item in revisions],
             'events': [ledger.row(event) for event in events]}
 
 

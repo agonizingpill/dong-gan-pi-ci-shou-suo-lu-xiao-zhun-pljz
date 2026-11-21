@@ -19,7 +19,7 @@ HEARTBEAT = Path('/tmp/worker-heartbeat')
 
 def claim(wakeup_id):
     with Session.begin() as db:
-        eligible = or_(CalibrationRelease.state == ReleaseState.QUEUED,
+        eligible = or_(CalibrationRelease.state.in_([ReleaseState.QUEUED, ReleaseState.SUSPENDED]),
                        (CalibrationRelease.state == ReleaseState.RUNNING) &
                        (CalibrationRelease.touched_at < utcnow() - timedelta(minutes=5)))
         query = select(CalibrationRelease).where(eligible)
@@ -60,8 +60,12 @@ def settle(job, result, error):
         within_window = inside(entry.prediction_pct, snapshot['window'])
         entry.state = ReleaseState.AWAITING if within_window else ReleaseState.RETEST
         batch.state = BatchState.REVIEW
+        entry.error = None
         run = db.get(ChamberRun, entry.run_id)
-        record(db, 'worker', 'fit.completed' if within_window else 'retest.opened',
+        recomputed = entry.affected_at is not None
+        action = ('fit.recomputed' if within_window else 'retest.reopened') if recomputed else \
+                 ('fit.completed' if within_window else 'retest.opened')
+        record(db, 'worker', action,
                f'{run.source_name} · {entry.prediction_pct:.3f}% · 工艺窗 {snapshot["window"]}', batch.code)
         log.info('calibration %s %s', release_id, entry.state.value)
 

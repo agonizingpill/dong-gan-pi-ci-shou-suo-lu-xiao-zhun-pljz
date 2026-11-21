@@ -55,6 +55,8 @@ h1, h2, h3, p, dl, ol { margin: 0; }
 .badge[data-state="frozen"], .badge[data-state="released"], .badge[data-state="verified"] { background: var(--teal-wash); border-color: oklch(87% .052 173); color: var(--teal); }
 .badge[data-state="draft"], .badge[data-state="held"], .badge[data-state="retest_required"], .badge[data-state="failed"] { background: var(--amber-wash); border-color: oklch(89% .055 82); color: var(--amber); }
 .badge[data-state="reference"] { background: var(--ground); border-color: var(--line); color: var(--muted); }
+.badge[data-state="suspended"], .badge[data-state="revoked"] { background: var(--amber-wash); border-color: oklch(89% .055 82); color: var(--amber); }
+.badge[data-state="affected"] { background: var(--wash); border-color: oklch(87% .04 226); color: var(--blue); }
 .batch-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 0 0 10px; }
 .batch-heading h2 { font-size: clamp(1.65rem, 3vw, 2.5rem); line-height: 1.1; margin-top: 3px; letter-spacing: -.055em; }
 .specs { display: grid; grid-template-columns: .8fr .65fr 1.2fr 1fr; border-block: 1px solid var(--line); margin: 10px 0 16px; }

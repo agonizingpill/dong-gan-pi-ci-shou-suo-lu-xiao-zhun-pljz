@@ -1,6 +1,46 @@
 import {store} from '../api.js';
 import {badge, measurementBand, pageTitle, sectionTitle, windowLabel} from '../components/ledger.js';
-import {events, h, number, stages, when} from '../presentation.js';
+import {events, h, number, revisionKinds, stages, when} from '../presentation.js';
+
+function trial(entry) {
+  return `<div class="results"><div><span>预测收缩率</span><strong class="mono">${entry.prediction_pct == null ? '—' : `${number(entry.prediction_pct)}%`}</strong></div>
+    <div><span>实测复核</span><strong class="mono">${entry.recheck_pct == null ? '—' : `${number(entry.recheck_pct)}%`}</strong></div>${badge(entry.state)}</div>
+    ${measurementBand(entry.snapshot.window, entry.prediction_pct, entry.recheck_pct)}
+    <div class="fit-metrics"><span><i class="dot prediction"></i>预测</span><span><i class="dot recheck"></i>复测</span><span><i class="dot window"></i>工艺窗</span></div>`;
+}
+
+function affectedBanner(entry) {
+  if (!entry.affected_at) return '';
+  const message = {
+    released: '保留原签发判定并标记受影响',
+    suspended: '暂停放行，正按原冻结曲线与剩余参考重算，完成后须重新复测',
+    held: '参考批不足，本次校准继续留置',
+  }[entry.state] || '状态随参考撤销更新';
+  return `<section class="sheet"><div class="padded">
+    <p class="callout warning">参考批 <b class="mono">${h(entry.affected_reference)}</b> 已撤销认证，本单${message}。
+    <br><small>撤销原因：${h(entry.affected_reason)} · 标记时间 ${when(entry.affected_at)}</small></p>
+    ${entry.signed_by && entry.state === 'released' ? `<dl class="ledger-meta"><div><dt>原签发人</dt><dd>${h(entry.signed_by)}</dd></div>
+      <div><dt>原签发时间</dt><dd>${when(entry.signed_at)}</dd></div><div><dt>原签发意见</dt><dd>${h(entry.release_note)}</dd></div></dl>` : ''}
+  </div></section>`;
+}
+
+function trialHistory(entry, revisions) {
+  const snapshots = revisions.filter(item => item.snapshot);
+  if (!snapshots.length) return '';
+  const rows = [...snapshots].reverse().map(item => ({label: revisionKinds[item.kind] || item.kind, item}));
+  const currentUnchanged = entry.state === 'released' && entry.affected_at;
+  if (!currentUnchanged) rows.push({label: '当前试算（撤销后）', item: {snapshot: entry.snapshot, prediction_pct: entry.prediction_pct,
+    recheck_pct: entry.recheck_pct, input_hash: entry.input_hash, reference_code: entry.affected_reference, created_at: entry.touched_at}});
+  return `<section class="sheet evidence">${sectionTitle('撤销前后试算', '撤销前快照与当前冻结曲线重算对比')}<div class="padded">
+    <table><thead><tr><th>试算</th><th>参考</th><th>预测</th><th>复测</th><th>快照指纹</th></tr></thead><tbody>
+    ${rows.map(({label, item}) => `<tr><th>${h(label)}<br><small>${when(item.created_at)}</small></th>
+      <td>${item.snapshot.training.length} 批${item.reference_code ? `<br><small>剔除 ${h(item.reference_code)}</small>` : ''}</td>
+      <td class="mono">${item.prediction_pct == null ? '—' : `${number(item.prediction_pct)}%`}</td>
+      <td class="mono">${item.recheck_pct == null ? '—' : `${number(item.recheck_pct)}%`}</td>
+      <td class="hash mono">${h(item.input_hash || '—')}</td></tr>`).join('')}</tbody></table>
+    <details class="entry-form evidence-details"><summary>撤销前的参考批次</summary><ul>${(snapshots.at(-1).snapshot.training || []).map(reference => `<li><span class="mono">${h(reference.batch)}</span> <span>${number(reference.observed)}%</span></li>`).join('')}</ul></details>
+    </div></section>`;
+}
 
 export function labPage() {
   const detail = store.batch;
@@ -28,9 +68,10 @@ export function labPage() {
 
 function registerTable() {
   if (!store.register.length) return '<p class="empty">提交首个符合条件的批次后，可在此跟踪复测与签发。</p>';
-  return `<table><thead><tr><th>冻干批次</th><th>校准状态</th><th>预测收缩率</th><th>冻结曲线</th></tr></thead><tbody>
+  return `<table><thead><tr><th>冻干批次</th><th>校准状态</th><th>预测收缩率</th><th>冻结曲线</th><th>受影响参考</th></tr></thead><tbody>
     ${store.register.map(entry => `<tr><th><a class="mono" href="#release/${entry.id}">${h(entry.batch_code)} / ${String(entry.id).padStart(3, '0')}</a></th>
-    <td>${badge(entry.state)}</td><td class="mono">${entry.prediction_pct == null ? '—' : `${number(entry.prediction_pct)}%`}</td><td class="mono">${h(entry.source_name)}</td></tr>`).join('')}</tbody></table>`;
+    <td>${badge(entry.state)}</td><td class="mono">${entry.prediction_pct == null ? '—' : `${number(entry.prediction_pct)}%`}</td><td class="mono">${h(entry.source_name)}</td>
+    <td>${entry.affected_reference ? `<span class="mono">${h(entry.affected_reference)}</span><br><small>${h(entry.affected_reason)}</small>` : '—'}</td></tr>`).join('')}</tbody></table>`;
 }
 
 function workflow(data) {
@@ -42,9 +83,10 @@ function workflow(data) {
     retest_required: '预测超出工艺窗。完成独立试片复测后留置本次校准，重新采集周期再试算。',
     verified: '试片复测处于工艺窗，等候主管签发。', held: '本次校准已留置。创建新的设备周期并重新测量。',
     released: '主管签发完成，冻干批次已放行。',
+    suspended: '参考批认证已撤销，暂停放行资格。正按原冻结曲线与剩余参考重算，窗内仍需重新复测。',
   };
   return `<section class="sheet workflow">${sectionTitle('复测与签发')}
-    <div class="padded"><p class="callout ${['held','retest_required','failed'].includes(entry.state) ? 'warning' : ''}">${h(eligibility[entry.state])}</p>
+    <div class="padded"><p class="callout ${['held','retest_required','failed','suspended'].includes(entry.state) ? 'warning' : ''}">${h(eligibility[entry.state])}</p>
     ${retest.length ? `<dl class="ledger-meta"><div><dt>复测试片</dt><dd class="mono">${h(retest[0].specimen)}</dd></div>
       ${retest.map(sample => `<div><dt>${h(stages[sample.stage])}厚度</dt><dd class="mono">${number(sample.thickness_mm, 3)} mm</dd></div>`).join('')}
       <div><dt>复测记录</dt><dd>${h(entry.recheck_note)}</dd></div></dl>` : ''}
@@ -61,7 +103,9 @@ function workflow(data) {
       <label class="wide">复测说明<textarea name="note" rows="2" minlength="4" required></textarea></label>
       <button class="primary">登记复测</button></form>` : ''}
     ${entry.state === 'verified' && role === 'supervisor' ? `<form data-action="release"><label class="wide">签发意见<textarea name="note" rows="2" minlength="4" required></textarea></label>
-      <button class="primary">签发批次放行</button></form>` : ''}</div></section>`;
+      <button class="primary">签发批次放行</button></form>` : ''}
+    ${entry.state === 'released' && entry.affected_at ? '<p class="callout warning">本单已标记受影响：原签发判定保留，不再受理新的签发或复测。</p>' : ''}
+    ${entry.state === 'held' && entry.affected_at ? `<a class="text-link" href="#batches/${h(batch.code)}">查看批次与参考状态 →</a>` : ''}</div></section>`;
 }
 
 export function releasePage() {
@@ -72,16 +116,14 @@ export function releasePage() {
   return `${pageTitle('放行详情', `${batch.code} / ${curve.source_name}`, '<a class="text-link" href="#release">← 放行台账</a>')}
     <div class="release-grid"><div>
       <section class="sheet result-panel">${sectionTitle(`校准单 #${String(entry.id).padStart(3, '0')}`, entry.snapshot.recipe)}<div class="padded">
-      <div class="results"><div><span>预测收缩率</span><strong class="mono">${entry.prediction_pct == null ? '—' : `${number(entry.prediction_pct)}%`}</strong></div>
-      <div><span>实测复核</span><strong class="mono">${entry.recheck_pct == null ? '—' : `${number(entry.recheck_pct)}%`}</strong></div>${badge(entry.state)}</div>
-      ${measurementBand(entry.snapshot.window, entry.prediction_pct, entry.recheck_pct)}
-      <div class="fit-metrics"><span><i class="dot prediction"></i>预测</span><span><i class="dot recheck"></i>复测</span><span><i class="dot window"></i>工艺窗</span></div></div></section>
+      ${trial(entry)}</div></section>
+      ${affectedBanner(entry)}
       <section class="sheet evidence">${sectionTitle('拟合证据', `${entry.snapshot.training.length} 个参考批次`)}<div class="padded">
       <dl class="evidence-grid"><div><dt>模型</dt><dd>Yeo–Johnson / Ridge</dd></div><div><dt>逐批留一 RMSE</dt><dd class="mono">${number(entry.result?.loo_rmse, 3)} pp</dd></div>
       <div><dt>Ridge α / 求解器</dt><dd class="mono">${number(entry.result?.alpha, 2)} / ${h(entry.result?.solver || '—')}</dd></div><div><dt>复现种子</dt><dd class="mono">${h(entry.result?.seed || '—')}</dd></div></dl>
       <details class="entry-form evidence-details"><summary>参考批次与快照指纹</summary><ul>${entry.snapshot.training.map(reference => `<li><span class="mono">${h(reference.batch)}</span> <span>${number(reference.observed)}%</span></li>`).join('')}</ul>
       <p class="hash mono">${h(entry.input_hash)}</p></details></div></section>
-    </div><div>${workflow(data)}<section class="sheet history">${sectionTitle('批次审计记录')}
+      ${trialHistory(entry, data.revisions || [])}</div><div>${workflow(data)}<section class="sheet history">${sectionTitle('批次审计记录')}
       <ol>${data.events.map(event => `<li><b>${h(events[event.action] || (event.action.endsWith('.blocked') ? '操作拒绝' : event.action))}</b><time>${when(event.happened_at)}</time>
       <p>${h(event.actor)} · ${h(event.detail)}</p></li>`).join('')}</ol></section></div></div>`;
 }

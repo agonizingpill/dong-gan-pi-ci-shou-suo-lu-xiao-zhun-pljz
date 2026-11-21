@@ -90,6 +90,11 @@ export function batchesPage() {
       <section class="sheet readings">${sectionTitle('试片厚度测量', '按试片编号配对')}${samplesTable(detail.samples)}
       ${operator && detail.runs[0]?.state === 'frozen' && detail.batch.state === 'collecting' ? sampleForm() : ''}
       ${supervisor && detail.batch.state === 'collecting' && !detail.readiness_issue ? `<details class="entry-form"><summary>认证为历史标定批次</summary>
-      <form data-action="archive"><label class="wide">认证依据<input name="note" minlength="4" required></label><button class="primary">认证参考批次</button></form></details>` : ''}</section>
+      <form data-action="archive"><label class="wide">认证依据<input name="note" minlength="4" required></label><button class="primary">认证参考批次</button></form></details>` : ''}
+      ${supervisor && detail.batch.state === 'reference' ? `<details class="entry-form"><summary>撤销参考认证</summary>
+      <p class="callout warning">撤销后该批次退出同配方参考。已签发的校准单保留原判定并标记受影响；未签发的有效校准单暂停放行，按原冻结曲线和剩余参考重算。</p>
+      <form data-action="revoke"><label class="wide">撤销原因<input name="note" minlength="4" required placeholder="如：参考批厚度读数错误"></label>
+      <button class="primary">撤销认证并处理受影响的校准单</button></form></details>` : ''}
+      ${supervisor && detail.batch.state === 'revoked' ? `<p class="callout warning">该批次已撤销参考认证，不再作为试算参考。</p>` : ''}</section>
       </div>` : '<p class="empty">登记第一批冻干物料，随后导入曲线。</p>'}</div>`;
 }
